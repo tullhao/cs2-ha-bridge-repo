@@ -1,237 +1,232 @@
 using System.Text;
 using System.Text.Json;
+using CounterStrike2GSI;
+using CounterStrike2GSI.Nodes;
 using MQTTnet;
 using MQTTnet.Client;
+using MQTTnet.Protocol;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.UseUrls("http://0.0.0.0:3001");
+record Options(
+    string mqtt_host = "core-mosquitto",
+    int mqtt_port = 1883,
+    string mqtt_username = "",
+    string mqtt_password = "",
+    string mqtt_base_topic = "cs2_bridge",
+    string discovery_prefix = "homeassistant",
+    bool publish_discovery = true
+);
 
-var app = builder.Build();
-
-var mqttHost = Env("MQTT_HOST", "core-mosquitto");
-var mqttPort = int.TryParse(Env("MQTT_PORT", "1883"), out var parsedPort) ? parsedPort : 1883;
-var mqttUser = Env("MQTT_USERNAME", "");
-var mqttPass = Env("MQTT_PASSWORD", "");
-var baseTopic = Env("MQTT_BASE_TOPIC", "cs2_bridge").Trim('/');
-var discoveryPrefix = Env("DISCOVERY_PREFIX", "homeassistant").Trim('/');
-var publishDiscovery = bool.TryParse(Env("PUBLISH_DISCOVERY", "true"), out var pd) && pd;
-
-var mqttFactory = new MqttFactory();
-var mqttClient = mqttFactory.CreateMqttClient();
-var mqttOptionsBuilder = new MqttClientOptionsBuilder().WithTcpServer(mqttHost, mqttPort);
-if (!string.IsNullOrWhiteSpace(mqttUser))
-    mqttOptionsBuilder = mqttOptionsBuilder.WithCredentials(mqttUser, mqttPass);
-var mqttOptions = mqttOptionsBuilder.Build();
-
-await EnsureConnectedAsync(mqttClient, mqttOptions);
-if (publishDiscovery)
-    await PublishDiscoveryAsync(mqttClient, discoveryPrefix, baseTopic);
-
-app.MapPost("/", async (HttpRequest request) =>
+class Program
 {
-    using var reader = new StreamReader(request.Body);
-    var raw = await reader.ReadToEndAsync();
-    if (string.IsNullOrWhiteSpace(raw))
-        return Results.BadRequest("Empty body");
-
-    Console.WriteLine($"Received GSI payload: {raw}");
-    await EnsureConnectedAsync(mqttClient, mqttOptions);
-
-    await PublishStringAsync(mqttClient, $"{baseTopic}/state/raw", raw);
-
-    try
+    static async Task Main(string[] args)
     {
-        using var doc = JsonDocument.Parse(raw);
-        var root = doc.RootElement;
+        var options = LoadOptions("/data/options.json");
 
-        var roundPhase = GetString(root, "round", "phase");
-        var bombState = GetString(root, "bomb", "state");
-        var bombCountdown = GetDouble(root, "bomb", "countdown");
-        var roundBomb = GetString(root, "round", "bomb");
-        var phaseName = GetString(root, "phase_countdowns", "phase");
-        var phaseTimeLeft = GetDouble(root, "phase_countdowns", "phase_ends_in");
-        var activity = GetString(root, "player", "activity");
-        var team = GetString(root, "player", "team");
-        var health = GetInt(root, "player", "state", "health");
-        var mapPhase = GetString(root, "map", "phase");
+        Console.WriteLine("Starting CS2 GSI Bridge on port 3001");
+        Console.WriteLine($"MQTT host: {options.mqtt_host}:{options.mqtt_port}");
+        Console.WriteLine($"MQTT base topic: {options.mqtt_base_topic}");
+        Console.WriteLine($"Discovery enabled: {options.publish_discovery}");
 
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/round/phase", roundPhase);
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/bomb/state", bombState);
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/round/bomb", roundBomb);
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/phase/name", phaseName);
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/player/activity", activity);
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/player/team", team);
-        await PublishIfHasValueAsync(mqttClient, $"{baseTopic}/map/phase", mapPhase);
-        if (bombCountdown is not null) await PublishStringAsync(mqttClient, $"{baseTopic}/bomb/countdown", bombCountdown.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
-        if (phaseTimeLeft is not null) await PublishStringAsync(mqttClient, $"{baseTopic}/phase/time_left", phaseTimeLeft.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
-        if (health is not null) await PublishStringAsync(mqttClient, $"{baseTopic}/player/health", health.Value.ToString());
+        var mqttFactory = new MqttClientFactory();
+        using var mqttClient = mqttFactory.CreateMqttClient();
 
-        var blinkMs = ComputeBlinkIntervalMs(bombState, bombCountdown, phaseName, phaseTimeLeft);
-        if (blinkMs is not null) await PublishStringAsync(mqttClient, $"{baseTopic}/light/blink_interval_ms", blinkMs.Value.ToString());
+        var mqttOptionsBuilder = new MqttClientOptionsBuilder()
+            .WithTcpServer(options.mqtt_host, options.mqtt_port);
 
-        var recommendedColor = ComputeRecommendedColor(bombState, bombCountdown, roundPhase, activity);
-        if (!string.IsNullOrWhiteSpace(recommendedColor))
-            await PublishStringAsync(mqttClient, $"{baseTopic}/light/recommended_color", recommendedColor!);
-
-        return Results.Ok(new
+        if (!string.IsNullOrWhiteSpace(options.mqtt_username))
         {
-            ok = true,
-            bombState,
-            bombCountdown,
-            roundPhase,
-            phaseName,
-            phaseTimeLeft,
-            blinkMs,
-            recommendedColor
-        });
+            mqttOptionsBuilder = mqttOptionsBuilder.WithCredentials(
+                options.mqtt_username,
+                options.mqtt_password ?? ""
+            );
+        }
+
+        var mqttOptions = mqttOptionsBuilder.Build();
+
+        await EnsureConnectedAsync(mqttClient, mqttOptions);
+
+        if (options.publish_discovery)
+        {
+            await PublishDiscoveryAsync(mqttClient, options);
+        }
+
+        var listener = new GameStateListener(3001);
+
+        listener.NewGameState += async (gameState) =>
+        {
+            try
+            {
+                await EnsureConnectedAsync(mqttClient, mqttOptions);
+                await PublishStateAsync(mqttClient, options, gameState);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Publish error: {ex}");
+            }
+        };
+
+        if (!listener.Start())
+        {
+            Console.WriteLine("Failed to start GSI listener on port 3001");
+            return;
+        }
+
+        Console.WriteLine("GSI listener started on port 3001");
+
+        await Task.Delay(Timeout.Infinite);
     }
-    catch (Exception ex)
+
+    static Options LoadOptions(string path)
     {
-        Console.WriteLine(ex);
-        return Results.BadRequest(ex.Message);
+        try
+        {
+            if (!File.Exists(path))
+            {
+                Console.WriteLine("No /data/options.json found, using defaults.");
+                return new Options();
+            }
+
+            var json = File.ReadAllText(path);
+            var opts = JsonSerializer.Deserialize<Options>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            return opts ?? new Options();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to load options.json, using defaults. Error: {ex.Message}");
+            return new Options();
+        }
     }
-});
 
-app.MapGet("/health", () => Results.Ok(new { ok = true }));
-
-await app.RunAsync();
-
-static string Env(string name, string fallback) => Environment.GetEnvironmentVariable(name) ?? fallback;
-
-static async Task EnsureConnectedAsync(IMqttClient client, MQTTnet.Client.MqttClientOptions options)
-{
-    if (client.IsConnected) return;
-    await client.ConnectAsync(options, CancellationToken.None);
-}
-
-static async Task PublishStringAsync(IMqttClient client, string topic, string payload, bool retain = true)
-{
-    var message = new MqttApplicationMessageBuilder()
-        .WithTopic(topic)
-        .WithPayload(payload)
-        .WithRetainFlag(retain)
-        .Build();
-
-    await client.PublishAsync(message, CancellationToken.None);
-}
-
-static async Task PublishIfHasValueAsync(IMqttClient client, string topic, string? payload, bool retain = true)
-{
-    if (!string.IsNullOrWhiteSpace(payload))
-        await PublishStringAsync(client, topic, payload!, retain);
-}
-
-static async Task PublishDiscoveryAsync(IMqttClient client, string discoveryPrefix, string baseTopic)
-{
-    var device = new
+    static async Task EnsureConnectedAsync(IMqttClient client, MqttClientOptions options)
     {
-        identifiers = new[] { "cs2_gsi_bridge" },
-        name = "CS2 GSI Bridge",
-        manufacturer = "OpenAI scaffold",
-        model = "CS2 GSI -> MQTT",
-        sw_version = "0.1.0"
-    };
+        if (client.IsConnected) return;
+        await client.ConnectAsync(options, CancellationToken.None);
+    }
 
-    async Task PublishSensor(string key, string name, string stateTopic, string? deviceClass = null, string? unit = null, string? icon = null)
+    static async Task PublishStateAsync(IMqttClient client, Options options, GameState gs)
     {
+        var baseTopic = options.mqtt_base_topic.TrimEnd('/');
+
+        await PublishAsync(client, $"{baseTopic}/state/raw", JsonSerializer.Serialize(gs));
+
+        var roundPhase = gs.Round?.Phase ?? "";
+        var bombState = gs.Round?.Bomb ?? "";
+        var phaseName = gs.Map?.Phase ?? "";
+
+        double phaseTimeLeft = 0;
+        if (double.TryParse(gs.PhaseCountdowns?.PhaseEndsIn ?? "", System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var phaseSeconds))
+            phaseTimeLeft = phaseSeconds;
+
+        double bombCountdown = 0;
+        if (double.TryParse(gs.Bomb?.Countdown ?? "", System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var bombSeconds))
+            bombCountdown = bombSeconds;
+
+        var playerActivity = gs.Player?.Activity ?? "";
+        var playerTeam = gs.Player?.Team ?? "";
+        var playerHealth = gs.Player?.State?.Health ?? 0;
+
+        await PublishAsync(client, $"{baseTopic}/round/phase", roundPhase);
+        await PublishAsync(client, $"{baseTopic}/round/bomb", bombState);
+        await PublishAsync(client, $"{baseTopic}/phase/name", phaseName);
+        await PublishAsync(client, $"{baseTopic}/phase/time_left", phaseTimeLeft.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        await PublishAsync(client, $"{baseTopic}/bomb/state", gs.Bomb?.State ?? bombState);
+        await PublishAsync(client, $"{baseTopic}/bomb/countdown", bombCountdown.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        await PublishAsync(client, $"{baseTopic}/player/activity", playerActivity);
+        await PublishAsync(client, $"{baseTopic}/player/team", playerTeam);
+        await PublishAsync(client, $"{baseTopic}/player/health", playerHealth.ToString());
+
+        var recommendedColor = "white";
+        var blinkIntervalMs = 0;
+
+        if (!string.IsNullOrWhiteSpace(gs.Bomb?.State) &&
+            gs.Bomb.State.Equals("planted", StringComparison.OrdinalIgnoreCase))
+        {
+            recommendedColor = "yellow";
+            blinkIntervalMs = CalculateBlinkIntervalMs(bombCountdown);
+        }
+        else if (phaseName.Equals("freezetime", StringComparison.OrdinalIgnoreCase) ||
+                 roundPhase.Equals("freezetime", StringComparison.OrdinalIgnoreCase))
+        {
+            recommendedColor = "white";
+            blinkIntervalMs = 0;
+        }
+
+        await PublishAsync(client, $"{baseTopic}/light/recommended_color", recommendedColor);
+        await PublishAsync(client, $"{baseTopic}/light/blink_interval_ms", blinkIntervalMs.ToString());
+    }
+
+    static int CalculateBlinkIntervalMs(double bombCountdown)
+    {
+        if (bombCountdown <= 0) return 0;
+        if (bombCountdown > 30) return 900;
+        if (bombCountdown > 20) return 700;
+        if (bombCountdown > 12) return 500;
+        if (bombCountdown > 7) return 320;
+        if (bombCountdown > 3) return 200;
+        return 140;
+    }
+
+    static async Task PublishDiscoveryAsync(IMqttClient client, Options options)
+    {
+        var discovery = options.discovery_prefix.TrimEnd('/');
+        var baseTopic = options.mqtt_base_topic.TrimEnd('/');
+        var deviceId = "cs2_gsi_bridge";
+        var deviceName = "CS2 GSI Bridge";
+
+        await PublishDiscoverySensor(client, discovery, deviceId, "bomb_state", "Bomb State", $"{baseTopic}/bomb/state", "mdi:bomb");
+        await PublishDiscoverySensor(client, discovery, deviceId, "bomb_countdown", "Bomb Countdown", $"{baseTopic}/bomb/countdown", "mdi:timer-outline", "s");
+        await PublishDiscoverySensor(client, discovery, deviceId, "round_phase", "Round Phase", $"{baseTopic}/round/phase", "mdi:flag-outline");
+        await PublishDiscoverySensor(client, discovery, deviceId, "phase_time_left", "Phase Time Left", $"{baseTopic}/phase/time_left", "mdi:timer-sand", "s");
+        await PublishDiscoverySensor(client, discovery, deviceId, "blink_interval_ms", "Blink Interval", $"{baseTopic}/light/blink_interval_ms", "mdi:lightbulb-auto", "ms");
+        await PublishDiscoverySensor(client, discovery, deviceId, "recommended_color", "Recommended Color", $"{baseTopic}/light/recommended_color", "mdi:palette");
+    }
+
+    static async Task PublishDiscoverySensor(
+        IMqttClient client,
+        string discoveryPrefix,
+        string deviceId,
+        string objectId,
+        string name,
+        string stateTopic,
+        string icon,
+        string? unit = null)
+    {
+        var topic = $"{discoveryPrefix}/sensor/{deviceId}/{objectId}/config";
+
         var payload = new Dictionary<string, object?>
         {
             ["name"] = name,
-            ["unique_id"] = $"cs2_gsi_bridge_{key}",
-            ["default_entity_id"] = $"sensor.cs2_gsi_bridge_{key}",
+            ["unique_id"] = $"{deviceId}_{objectId}",
             ["state_topic"] = stateTopic,
-            ["device"] = device,
+            ["icon"] = icon,
+            ["device"] = new Dictionary<string, object?>
+            {
+                ["identifiers"] = new[] { deviceId },
+                ["name"] = "CS2 GSI Bridge",
+                ["manufacturer"] = "tullhao",
+                ["model"] = "CS2 GSI MQTT Bridge"
+            }
         };
-        if (deviceClass is not null) payload["device_class"] = deviceClass;
-        if (unit is not null) payload["unit_of_measurement"] = unit;
-        if (icon is not null) payload["icon"] = icon;
 
-        var topic = $"{discoveryPrefix}/sensor/cs2_gsi_bridge/{key}/config";
-        await PublishStringAsync(client, topic, JsonSerializer.Serialize(payload));
+        if (!string.IsNullOrWhiteSpace(unit))
+            payload["unit_of_measurement"] = unit;
+
+        await PublishAsync(client, topic, JsonSerializer.Serialize(payload), true);
     }
 
-    await PublishSensor("bomb_state", "CS2 Bomb State", $"{baseTopic}/bomb/state", icon: "mdi:bomb");
-    await PublishSensor("bomb_countdown", "CS2 Bomb Countdown", $"{baseTopic}/bomb/countdown", unit: "s", icon: "mdi:timer-outline");
-    await PublishSensor("round_phase", "CS2 Round Phase", $"{baseTopic}/round/phase", icon: "mdi:timer-play-outline");
-    await PublishSensor("phase_name", "CS2 Phase Name", $"{baseTopic}/phase/name", icon: "mdi:timeline-clock-outline");
-    await PublishSensor("phase_time_left", "CS2 Phase Time Left", $"{baseTopic}/phase/time_left", unit: "s", icon: "mdi:timer-sand");
-    await PublishSensor("player_activity", "CS2 Player Activity", $"{baseTopic}/player/activity", icon: "mdi:run-fast");
-    await PublishSensor("player_team", "CS2 Player Team", $"{baseTopic}/player/team", icon: "mdi:account-group");
-    await PublishSensor("player_health", "CS2 Player Health", $"{baseTopic}/player/health", icon: "mdi:heart-pulse");
-    await PublishSensor("blink_interval_ms", "CS2 Blink Interval", $"{baseTopic}/light/blink_interval_ms", unit: "ms", icon: "mdi:led-on");
-    await PublishSensor("recommended_color", "CS2 Recommended Color", $"{baseTopic}/light/recommended_color", icon: "mdi:palette");
-}
-
-static string? GetString(JsonElement root, params string[] path)
-{
-    if (!TryGet(root, out var value, path)) return null;
-    return value.ValueKind switch
+    static async Task PublishAsync(IMqttClient client, string topic, string payload, bool retain = false)
     {
-        JsonValueKind.String => value.GetString(),
-        JsonValueKind.Number => value.ToString(),
-        JsonValueKind.True => "true",
-        JsonValueKind.False => "false",
-        _ => null
-    };
-}
+        var message = new MqttApplicationMessageBuilder()
+            .WithTopic(topic)
+            .WithPayload(Encoding.UTF8.GetBytes(payload))
+            .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+            .WithRetainFlag(retain)
+            .Build();
 
-static int? GetInt(JsonElement root, params string[] path)
-{
-    if (!TryGet(root, out var value, path)) return null;
-    return value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number) ? number : null;
-}
-
-static double? GetDouble(JsonElement root, params string[] path)
-{
-    if (!TryGet(root, out var value, path)) return null;
-    return value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number) ? number : null;
-}
-
-static bool TryGet(JsonElement element, out JsonElement value, params string[] path)
-{
-    value = element;
-    foreach (var part in path)
-    {
-        if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(part, out value))
-            return false;
+        await client.PublishAsync(message, CancellationToken.None);
     }
-    return true;
-}
-
-static int? ComputeBlinkIntervalMs(string? bombState, double? bombCountdown, string? phaseName, double? phaseTimeLeft)
-{
-    if (string.Equals(bombState, "planted", StringComparison.OrdinalIgnoreCase) && bombCountdown is > 0)
-    {
-        var t = bombCountdown.Value;
-        if (t > 35) return 900;
-        if (t > 30) return 820;
-        if (t > 25) return 720;
-        if (t > 20) return 620;
-        if (t > 15) return 500;
-        if (t > 10) return 380;
-        if (t > 6) return 260;
-        if (t > 3) return 180;
-        return 120;
-    }
-
-    if (string.Equals(phaseName, "live", StringComparison.OrdinalIgnoreCase) && phaseTimeLeft is > 0)
-    {
-        var t = phaseTimeLeft.Value;
-        if (t <= 20) return 700;
-    }
-
-    return null;
-}
-
-static string? ComputeRecommendedColor(string? bombState, double? bombCountdown, string? roundPhase, string? activity)
-{
-    if (string.Equals(bombState, "planted", StringComparison.OrdinalIgnoreCase))
-    {
-        if (bombCountdown is <= 10) return "red";
-        return "yellow";
-    }
-
-    if (string.Equals(roundPhase, "freezetime", StringComparison.OrdinalIgnoreCase)) return "white";
-    if (string.Equals(activity, "menu", StringComparison.OrdinalIgnoreCase)) return "off";
-    return null;
 }
