@@ -1,0 +1,15 @@
+configuration:
+  mqtt_host:
+    name: MQTT host
+  mqtt_port:
+    name: MQTT port
+  mqtt_username:
+    name: MQTT username
+  mqtt_password:
+    name: MQTT password
+  mqtt_base_topic:
+    name: MQTT base topic
+  discovery_prefix:
+    name: Discovery prefix
+  publish_discovery:
+    name: Publish MQTT discovery
